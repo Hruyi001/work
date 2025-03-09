@@ -363,9 +363,9 @@ public Result login(LoginFormDTO loginForm, HttpSession session) {
     }
 ```
 ### 2. 实现优惠券秒杀下单
-* tb_voucher: 优惠卷的基本信息，优惠金额、使用规则等
+* tb_voucher: 优惠卷的基本信息，优惠金额、使用规则等。（主键：优惠券的id)
 * tb_seckill_voucher: 优惠券的库存、开始抢购时间、结束抢购时间。(特价券才要填写这些信息)
-
+* tb_voucher_order: 优惠券订单表，记录了下单的用户id、购买的代金卷id
     实现优惠券秒杀的下单功能：
         * 秒杀是否开始或结束，如果尚未开始或已经结束则无法下单
         * 库存是否充足，不足则无法下单
@@ -728,6 +728,37 @@ Redlock 算法的核心思想是不依赖于单个 Redis 实例或主从复制�
     2. 基于Lua脚本，判断秒杀库存、一人一单，决定用户是否抢购成功  
     3. 如果抢购成功，将优惠券id和用户id封装后存入阻塞队列  
     4. 开启线程任务，不断从阻塞队列中获取信息，实现异步下单功能  
+为了快速查找库存、订单信息，将秒杀库存和订单信息保存到Redis中，秒杀库存使用String类型保存，订单信息使用Set类型保存。比如，在添加库存方法中，先向Mysql，再向redis中添加库存信息。
+"优惠券1":23
+### 4.2.1 超卖问题的步骤
+1. 提交优惠券id
+2. 查询优惠券信息
+3. 判断秒杀是否开始
+4. 判断库存是否充足
+5. 扣减库存
+6. 创建订单
+#### 4.2.2 超卖 + 一人一单的步骤
+需求：修改秒杀业务，要求同一个优惠券，一个用户只能下一单
+1. 提交优惠券id
+2. 查询优惠券信息
+3. 判断秒杀是否开始
+4. 判断库存是否充足
+5. 根据优惠券id和用户id查询订单
+6. 判断订单是否存在
+7. 订单如果不存在，扣减库存，创建订单
+#### 4.2.3 setnx分布式锁
+```sh
+set lock value NX EX 10
+```
+释放setnx锁时，要使用lua脚本实现原子化操作
+```sh
+# 如果key存在且value相等，则删除key
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+```
 1. 
 ```java
 // 保存优惠券信息到redis中
@@ -746,7 +777,7 @@ Redlock 算法的核心思想是不依赖于单个 Redis 实例或主从复制�
         stringRedisTemplate.opsForValue().set(SECKILL_STOCK_KEY + voucher.getId(), voucher.getStock().toString());
     }
 ```
-2. lua脚本
+1. lua脚本
 ```lua
 -- 1.参数列表
 -- 1.1.优惠券id
@@ -854,6 +885,7 @@ b. stream的消费组模式
     1. 创建一个Stream类型的消息队列，名为stream.orders
     2. 修改之前的秒杀下单Lua脚本，在认定有抢单资格后，直接向stream.orders添加消息，内容包含voucherId、userId、orderId
     3. 项目启动时，开启一个线程任务，尝试获取stream.orders中消息，完成下单
+   
 1. lua脚本  
 ```lua
 -- 1.参数列表
@@ -1372,3 +1404,212 @@ return 0
         System.out.println("count = " + count);
     }
 ```
+## 八. 商品排行榜
+嗯，用户问的是Java后端实现商品点赞排行榜的功能，我得好好想想怎么回答。首先，得确定用户的需求是什么。点赞排行榜，应该就是根据商品的点赞数来排序，展示前多少名的商品对吧？可能用户需要实时更新的排行榜，或者定时更新的？可能还要考虑高并发的情况，比如双十一这种时候，点赞量激增，系统要能扛得住。
+
+那首先得考虑数据结构。排行榜通常用Redis的Sorted Set比较合适，因为可以自动排序，而且效率高。每个商品的点赞数作为分数，商品ID作为成员。这样每次点赞操作，只需要更新对应商品的分数，然后取排行榜的时候直接取前N个就行了。
+
+不过用户可能对Redis不熟，或者项目里还没引入Redis，那可能需要用数据库来实现。比如MySQL，可以给商品表加个点赞数字段，然后查询的时候按点赞数倒序，分页取数据。不过这样的话，高并发下频繁更新点赞数可能会有性能问题，需要考虑缓存或者异步处理。
+
+接下来是点赞操作。如果用Redis的话，每个点赞操作就是ZINCRBY命令，增加对应的分数。然后定时把Redis的数据同步到数据库，比如每隔一段时间或者达到一定次数后写入数据库，这样避免频繁操作数据库。不过需要考虑数据一致性问题，如果同步过程中出现故障，可能会有数据丢失。这时候可能需要写日志或者用消息队列来保证可靠性。
+
+如果用数据库的话，每次点赞都要更新数据库的点赞数，这时候可能会有锁的问题，比如行锁，或者使用乐观锁，通过版本号控制。不过高并发下，频繁更新同一行可能会导致性能瓶颈。这时候可以考虑缓存点赞数，先更新缓存，再异步更新数据库，或者合并多次点赞操作，批量更新。
+
+然后是排行榜的查询，如果用Redis的话，直接ZREVRANGE取前N个就行，速度很快。如果用数据库的话，需要按点赞数倒序排序，分页查询。不过当数据量大的时候，分页可能会变慢，尤其是深分页，这时候可以用游标或者缓存结果。
+
+还要考虑排行榜的更新频率。是实时更新，还是定时计算？比如每隔10分钟更新一次排行榜，这时候可以用定时任务，把数据从Redis同步到数据库，然后生成排行榜。实时的话，每次点赞都更新排行榜的数据结构。
+
+另外，商品可能很多，排行榜只需要前100或者前500，那么Redis的Sorted Set只需要维护前N个，可能的话，定期修剪后面的成员，节省内存。或者使用分段统计，比如按小时、天来统计，综合计算热度。
+
+安全方面，要防止用户重复点赞，每个用户只能点一次。这时候需要在Redis或者数据库里记录用户的点赞状态，比如用另一个集合或者表来存用户ID和商品ID的关系。点赞前先检查是否已经点过，没点过的话才增加点赞数，并记录状态。这里可能涉及到分布式锁，或者Redis的原子操作，比如SETNX，确保并发下的正确性。
+
+还有，需要考虑分页，比如排行榜一页显示20个，用户翻页的时候怎么处理。如果用Redis的话，ZREVRANGE可以指定起始和结束索引。数据库的话，用limit和offset，但要注意offset过大时的性能问题。
+
+扩展性方面，如果商品数量极大，可能需要分片存储，比如按商品类别分不同的Sorted Set，或者用多个Redis实例。不过对于一般场景，单个Sorted Set应该足够了。
+
+数据持久化方面，Redis的RDB和AOF可以保证数据不丢失，但最好还是定期同步到数据库，双重保障。同时，要考虑异常情况下的恢复机制，比如Redis宕机后，从数据库重新加载数据到Redis。
+
+最后，接口设计。点赞接口需要接收用户ID和商品ID，检查是否已点赞，然后增加点赞数，更新排行榜。获取排行榜接口返回排序后的商品列表，可能还需要分页参数。返回的数据结构可以包括商品ID、名称、图片、点赞数等信息，可能需要关联商品表查询。
+
+测试的话，要考虑并发点赞的情况，使用JMeter或者类似的工具模拟多用户同时点赞，验证数据的一致性和系统的稳定性。还有网络延迟、超时处理、重试机制等。
+
+可能用户还希望有排行榜的缓存，比如将排行榜结果缓存在Redis中，设置过期时间，每隔一段时间更新一次，减少实时查询的压力。不过如果是实时更新的，可能不需要缓存，直接查Sorted Set。
+
+总结下来，步骤大概是：
+
+1. 数据结构选择：Redis Sorted Set或数据库字段。
+2. 点赞操作实现：原子增加，防止重复。
+3. 排行榜查询：高效获取前N名。
+4. 数据同步：Redis到数据库的同步策略。
+5. 高并发处理：异步、批量、缓存。
+6. 安全与幂等：用户只能点一次。
+7. 扩展和优化：分页、分片、缓存结果。
+
+可能需要根据用户的具体场景和技术栈来调整，比如如果已经用了Redis，就优先用Sorted Set；如果只有MySQL，可能需要结合缓存和异步处理来优化性能。
+
+
+
+
+实现商品点赞排行榜功能需要考虑数据结构、实时性、性能以及扩展性等因素。以下是一个基于Java后端的实现方案，结合Redis和MySQL，适用于高并发场景：
+
+### 1. 技术选型
+• **Redis**：使用Sorted Set（有序集合）存储实时排行榜，确保高性能读写
+• **MySQL**：持久化存储商品基础信息和总点赞数
+• **分布式锁**：防止重复点赞（Redis或Redisson实现）
+• **消息队列**：异步处理数据持久化（可选，如RabbitMQ/Kafka）
+
+### 2. 核心实现步骤
+
+#### 2.1 数据结构设计
+```sql
+-- MySQL商品表
+CREATE TABLE product (
+    id BIGINT PRIMARY KEY COMMENT '商品ID',
+    name VARCHAR(255) COMMENT '商品名称',
+    like_count INT DEFAULT 0 COMMENT '总点赞数',
+    -- 其他字段...
+);
+```
+
+```java
+// Redis数据结构
+String REDIS_RANK_KEY = "product:like:rank"; // SortedSet key
+String REDIS_LIKE_PREFIX = "product:like:";  // 用户点赞记录 Set key
+```
+
+#### 2.2 点赞接口实现
+```java
+public boolean likeProduct(Long userId, Long productId) {
+    // 1. 校验用户是否已点赞
+    String userLikeKey = REDIS_LIKE_PREFIX + productId;
+    Boolean isLiked = redisTemplate.opsForSet().isMember(userLikeKey, userId);
+    if (Boolean.TRUE.equals(isLiked)) {
+        return false; // 已点赞
+    }
+
+    // 2. 获取分布式锁（防止并发重复提交）
+    String lockKey = "lock:product_like:" + productId;
+    try {
+        // 使用Redisson实现锁，设置3秒自动过期
+        RLock lock = redissonClient.getLock(lockKey);
+        if (!lock.tryLock(0, 3, TimeUnit.SECONDS)) {
+            throw new RuntimeException("系统繁忙，请稍后重试");
+        }
+
+        // 3. 原子操作：更新Redis
+        redisTemplate.opsForZSet().incrementScore(REDIS_RANK_KEY, productId.toString(), 1);
+        redisTemplate.opsForSet().add(userLikeKey, userId);
+        
+        // 4. 异步更新数据库（通过消息队列）
+        sendLikeMessage(productId, 1); 
+
+        return true;
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("点赞操作失败");
+    } finally {
+        redissonClient.getLock(lockKey).unlock();
+    }
+}
+
+// 发送MQ消息示例
+private void sendLikeMessage(Long productId, int delta) {
+    Map<String, Object> message = new HashMap<>();
+    message.put("productId", productId);
+    message.put("delta", delta);
+    rabbitTemplate.convertAndSend("product.like.exchange", "like.routingKey", message);
+}
+```
+
+#### 2.3 排行榜查询
+```java
+public List<ProductRankVO> getProductRank(int topN) {
+    // 从Redis获取实时排行
+    Set<ZSetOperations.TypedTuple<String>> tuples = redisTemplate.opsForZSet()
+        .reverseRangeWithScores(REDIS_RANK_KEY, 0, topN - 1);
+
+    List<ProductRankVO> rankList = new ArrayList<>();
+    if (tuples != null) {
+        for (ZSetOperations.TypedTuple<String> tuple : tuples) {
+            Long productId = Long.parseLong(tuple.getValue());
+            // 获取商品详细信息（可缓存优化）
+            Product product = productService.getProductById(productId);
+            
+            ProductRankVO vo = new ProductRankVO();
+            vo.setProductId(productId);
+            vo.setProductName(product.getName());
+            vo.setLikeCount(tuple.getScore().intValue());
+            rankList.add(vo);
+        }
+    }
+    return rankList;
+}
+```
+
+### 3. 数据同步方案
+**异步持久化消费者**：
+```java
+@RabbitListener(queues = "product.like.queue")
+public void handleLikeMessage(Map<String, Object> message) {
+    Long productId = (Long) message.get("productId");
+    int delta = (Integer) message.get("delta");
+    
+    // 更新数据库点赞数（乐观锁保证并发安全）
+    productMapper.updateLikeCount(productId, delta);
+    
+    // 可选：定期将Redis数据全量同步到数据库
+}
+```
+
+**MySQL更新语句**：
+```sql
+UPDATE product 
+SET like_count = like_count + #{delta} 
+WHERE id = #{productId}
+```
+
+### 4. 性能优化策略
+1. **缓存穿透**：对不存在的商品ID做空值缓存
+2. **热点数据**：
+   • 本地缓存热门商品信息（Caffeine）
+   • 使用Redis Cluster分片存储排行榜数据
+3. **数据压缩**：使用Protobuf序列化存储
+4. **限流措施**：对高频访问接口做限流（Guava RateLimiter）
+
+### 5. 扩展功能
+1. **时间维度排行**：按周/月排行榜（使用多个Sorted Set）
+   ```java
+   // 每周排行榜key示例
+   String weeklyKey = REDIS_RANK_KEY + ":week_" + getWeekNumber();
+   ```
+2. **热榜计算**：综合点赞数、时间衰减因子计算热度
+   ```java
+   // 热度计算公式示例：热度 = 点赞数 * e^(-衰减系数*时间差)
+   double hotScore = likeCount * Math.exp(-decayFactor * timeDiff);
+   ```
+3. **防刷机制**：
+   • IP限流（1分钟最多点赞10次）
+   • 设备指纹校验
+   • 异常行为检测（突然大量点赞）
+
+### 6. 监控指标
+1. Redis命中率
+2. 点赞接口QPS
+3. 消息队列积压情况
+4. 数据库更新延迟
+
+### 架构示意图
+```
+[客户端]
+   │
+   ▼
+[API网关] → 限流、鉴权
+   │
+   ▼
+[点赞服务] ←→ Redis（排行榜数据）
+   │  异步
+   ▼     ↘
+[消息队列] → [数据同步服务] → MySQL
+```
+
+该方案结合了Redis的高性能和MySQL的数据持久化能力，通过异步处理保证最终一致性，能够支撑百万级QPS的点赞请求。实际部署时需要根据业务规模调整Redis集群规模和数据库分库分表策略。
