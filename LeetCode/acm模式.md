@@ -1,3 +1,14 @@
+## 万能头文件
+#include <bits/stdc++.h>
+  
+## c++输入输出
+### 1.读取字符串
+string s;
+getline(cin, s): 读取整行
+
+### 2.读取字符
+char c = getchar()
+
 ### 1. 链表的输入输出
 ```c++
 #include<iostream>

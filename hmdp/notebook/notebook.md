@@ -1525,7 +1525,10 @@ private void sendLikeMessage(Long productId, int delta) {
 ```java
 public List<ProductRankVO> getProductRank(int topN) {
     // 从Redis获取实时排行
-    Set<ZSetOperations.TypedTuple<String>> tuples = redisTemplate.opsForZSet()
+    Set<ZSetOperations.TypedTuple<String>> tuples = redisTemplate.
+    
+    
+    opsForZSet()
         .reverseRangeWithScores(REDIS_RANK_KEY, 0, topN - 1);
 
     List<ProductRankVO> rankList = new ArrayList<>();
